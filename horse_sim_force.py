@@ -20,7 +20,7 @@ CORNER_RADIUS = (2083.1 - 2 * STRAIGHT_LEN) / (2 * np.pi)
 CORNER_LEN = np.pi * CORNER_RADIUS # コーナーの周長 (半円)
 
 # Track
-TRACK_WIDTH = 18.0      # コース幅
+TRACK_WIDTH = 30.0      # コース幅
 
 # Physics
 TAU = 0.5               # 推進力の応答時間 (小さいほど反応が速い)
@@ -54,7 +54,7 @@ SPEED_CRUISE = 17.0     # 巡航時の目標速度 (m/s)
 SPEED_SPURT = 18.0      # スパート時の目標速度 (m/s)
 
 # Sections (レース区間)
-DIST_CRUISE_START = 400.0        # 巡航速度に移行する距離
+DIST_CRUISE_START = 300.0        # 巡航速度に移行する距離
 
 # 動的スパート戦略のための定数
 MIN_SPURT_ENERGY = 0.0          # スパート開始に必要な最低限の貯蓄エネルギー
@@ -63,6 +63,14 @@ SPURT_THRESHOLD_DIST = 700.0    # ゴール前700mを切るまではスパート
 # 逃げ馬の戦略用定数
 LEAD_BUFFER_DIST = 2.5          # 後続との差がこれ以上開いたら息を入れ始める距離 (m)
 SPEED_PACE_DOWN = 16.5          # 息を入れる際の目標速度 (m/s) 
+
+# 捲り(まくり)進出の戦略用定数
+MAKURI_START_DIST = 600.0       # この距離を通過して以降、捲り進出を許可する (m)
+MAKURI_FORWARD_GAP = 6.0        # 前の馬とこれ以上間隔が空いていれば前が開いていると判定 (m)
+MAKURI_SIDE_CLEAR = 2.0         # 外側のこの横幅以内に馬がいなければ外に出せると判定 (m)
+MAKURI_SIDE_RANGE = 8.0         # 外側の馬を確認する前後方向の範囲 (m)
+MAKURI_SPEED = 17.5             # 捲り進出中の目標速度 (m/s)
+MAKURI_LATERAL_OFFSET = 2.5     # 捲り開始時に外側へ持ち出す固定幅 (m)
 
 
 class RaceSimulation:
@@ -98,6 +106,8 @@ class RaceSimulation:
         # 各馬の状態管理変数
         self.is_sprinting = np.zeros(self.n, dtype=bool) # 現在スパート中か
         self.spurt_start_dist = np.zeros(self.n) # スパートを開始した距離
+        self.is_makuri = np.zeros(self.n, dtype=bool) # 現在捲り進出中か
+        self.makuri_target_lat = np.zeros(self.n) # 捲り進出時に固定する目標横位置
         
         # --- 結果集計用の変数を追加 ---
         self.finish_times = [None] * self.n       # ゴールタイム
@@ -252,7 +262,7 @@ class RaceSimulation:
                 leaders_ds = TOTAL_DISTANCE * 2 
                 for j in range(self.n):
                     if i == j: continue
-                    if self.pos[j, 0] > self.pos[i, 0]: 
+                    if self.pos[j, 0] > self.pos[i, 0] and abs(self.pos[j, 1] - self.pos[i, 1]) < 1.2: 
                         leaders_ds = min(leaders_ds, self.pos[j, 0] - self.pos[i, 0])
 
                 remaining_dist = TOTAL_DISTANCE - dist_run
@@ -262,13 +272,50 @@ class RaceSimulation:
                 if (self.saved_energy[i] > MIN_SPURT_ENERGY and leaders_ds > WAKE_DIST and can_spurt_by_distance) or force_spurt:
                     self.is_sprinting[i] = True
                     self.spurt_start_dist[i] = dist_run
+                    self.is_makuri[i] = False # スパートに移行したら捲り状態は解除する
+
+            # --- 捲り進出の判定 ---
+            # 600m通過以降、スパート開始前の馬を対象に、外にスペースがあり前が開いていれば
+            # 先頭目掛けて進出を開始する。先頭に立った後の速度はスパート開始まで抑制される。
+            if not self.is_sprinting[i] and not self.is_makuri[i] and dist_run > MAKURI_START_DIST:
+                # 前方の同レーン付近の馬との間隔を確認
+                forward_gap = TOTAL_DISTANCE * 2
+                for j in range(self.n):
+                    if i == j: continue
+                    ds_j = self.pos[j, 0] - self.pos[i, 0]
+                    if ds_j > 0 and abs(self.pos[j, 1] - self.pos[i, 1]) < 1.2:
+                        forward_gap = min(forward_gap, ds_j)
+                front_is_open = (forward_gap > MAKURI_FORWARD_GAP)
+
+                # 外側(ラチから遠い側)に出すスペースがあるか確認
+                side_is_clear = True
+                for j in range(self.n):
+                    if i == j: continue
+                    ds_j = self.pos[j, 0] - self.pos[i, 0]
+                    dn_j = self.pos[j, 1] - self.pos[i, 1]
+                    if abs(ds_j) < MAKURI_SIDE_RANGE and 0 < dn_j < MAKURI_SIDE_CLEAR:
+                        side_is_clear = False
+                        break
+
+                # 自分が先頭でない場合のみ捲り進出の対象とする
+                is_not_leader = (max_pos - s_now) > 1.0
+
+                if front_is_open and side_is_clear and is_not_leader:
+                    self.is_makuri[i] = True
+                    # 目標横位置をこの時点で一度だけ固定する (毎フレーム再計算しない)
+                    fixed_target = n_lat + MAKURI_LATERAL_OFFSET
+                    self.makuri_target_lat[i] = min(fixed_target, TRACK_WIDTH - RADIUS)
 
             # --- 目標速度 v_target の決定 ---
             if dist_run < DIST_CRUISE_START:
                 v_target = self.speed_start[i] * self.start_dash[i]
             elif not self.is_sprinting[i]:
                 v_target = self.speed_cruise[i]
-                
+
+                # 捲り進出中は巡航より高い速度で前へ出ようとする
+                if self.is_makuri[i]:
+                    v_target = MAKURI_SPEED
+
                 min_lead_distance = TOTAL_DISTANCE * 2
                 rear_positions = self.pos[self.pos[:, 0] < s_now, 0]
                 if len(rear_positions) > 0:
@@ -279,16 +326,21 @@ class RaceSimulation:
                     forward_pos = self.pos[forward_mask]
                     forward_vel = self.vel[forward_mask]
                     ds_array = forward_pos[:, 0] - s_now
-                    close_leader_mask = ds_array < WAKE_DIST
+                    dn_array = forward_pos[:, 1] - n_lat
+                    close_leader_mask = (ds_array < WAKE_DIST) & (np.abs(dn_array) < 1.2)
                     
                     if np.any(close_leader_mask):
                         closest_leader_idx = np.argmin(ds_array[close_leader_mask])
                         closest_leader_speed = forward_vel[close_leader_mask][closest_leader_idx, 0]
                         v_target = min(v_target, closest_leader_speed + 0.5) 
 
+                # 先頭に立っており後続を離している場合は、スパート開始前まで速度を抑える。
+                # 通常の巡航馬に加え、捲りで先頭に立った馬にも同じ抑制を適用する。
                 is_leader = (max_pos - s_now) < 1.0 
                 if is_leader and min_lead_distance > LEAD_BUFFER_DIST:
-                    v_target = SPEED_PACE_DOWN 
+                    v_target = SPEED_PACE_DOWN
+                    if self.is_makuri[i]:
+                        self.is_makuri[i] = False
                         
             else:
                 bonus = min(self.saved_energy[i] * SAVING_COEFF, 3.0)
@@ -360,6 +412,11 @@ class RaceSimulation:
                                 avoid_target = self.pos[j, 1] + 1.8 
                                 if avoid_target > target_n:
                                     target_n = avoid_target
+
+            # 捲り進出中は、開始時に固定した目標横位置まで持ち出す
+            if self.is_makuri[i]:
+                if self.makuri_target_lat[i] > target_n:
+                    target_n = self.makuri_target_lat[i]
 
             v_n = self.vel[i, 1]
             damping = -20.0 * v_n * mass_i 
